@@ -1,0 +1,12 @@
+(
+    name: "Gopass",
+    description: "Syntax: gp <query>\nCopy password from gopass to clipboard",
+    query: (
+        regex: "^gp ",
+        help: "gp ",
+        isolate: true,
+        no_sort: true,
+    ),
+    bin: (path: "cosmic-gopass-plugin"),
+    icon: Name("dialog-password"),
+)

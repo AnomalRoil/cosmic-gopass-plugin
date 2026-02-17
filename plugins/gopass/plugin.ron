@@ -6,6 +6,7 @@
         help: "gp ",
         isolate: true,
         no_sort: true,
+        history: false,
     ),
     bin: (path: "cosmic-gopass-plugin"),
     icon: Name("dialog-password"),

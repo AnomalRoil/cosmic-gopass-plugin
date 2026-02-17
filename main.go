@@ -1,31 +1,24 @@
 package main
 
 import (
-	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/syslog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
+	"syscall"
+
+	"github.com/AnomalRoil/cosmic-gopass-plugin/autotype"
+	"github.com/AnomalRoil/cosmic-gopass-plugin/launcher"
 )
 
-var (
-	gopassPath   string
-	outputMu     sync.Mutex
-	passwordIcon = "dialog-password"
-)
+var gopassPath string
 
 const maxResults = 19
-
-type entry struct {
-	original string
-	lower    string
-}
 
 func findGopass() string {
 	if p, err := exec.LookPath("gopass"); err == nil {
@@ -52,49 +45,7 @@ func findGopass() string {
 	return "gopass"
 }
 
-// Request types from pop-launcher
-type Request struct {
-	Search   *string `json:"Search,omitempty"`
-	Activate *uint32 `json:"Activate,omitempty"`
-	Complete *uint32 `json:"Complete,omitempty"`
-	Context  *uint32 `json:"Context,omitempty"`
-}
-
-// PluginResponse types to pop-launcher
-type IconSource struct {
-	Name *string `json:"Name,omitempty"`
-}
-
-type PluginSearchResult struct {
-	ID          uint32      `json:"id"`
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	Icon        *IconSource `json:"icon,omitempty"`
-}
-
-type AppendResponse struct {
-	Append PluginSearchResult `json:"Append"`
-}
-
-func respond(v any) {
-	outputMu.Lock()
-	defer outputMu.Unlock()
-	data, err := json.Marshal(v)
-	if err != nil {
-		log.Printf("ERROR: failed to marshal response: %v", err)
-		return
-	}
-	os.Stdout.Write(data)
-	os.Stdout.Write([]byte{'\n'})
-}
-
-func respondRaw(s string) {
-	outputMu.Lock()
-	defer outputMu.Unlock()
-	fmt.Println(s)
-}
-
-func loadEntries() []entry {
+func loadEntries() map[string]string {
 	log.Println("Loading gopass entries...")
 	cmd := exec.Command(gopassPath, "--nosync", "ls", "-flat")
 	out, err := cmd.Output()
@@ -102,11 +53,12 @@ func loadEntries() []entry {
 		log.Printf("ERROR: gopass ls failed: %v", err)
 		return nil
 	}
-	var entries []entry
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+	allEntries := strings.Split(strings.TrimSpace(string(out)), "\n")
+	entries := make(map[string]string, len(allEntries))
+	for _, line := range allEntries {
 		if line != "" {
 			// we pre-compute the lower case version of the entry to avoid doing it in the loop
-			entries = append(entries, entry{original: line, lower: strings.ToLower(line)})
+			entries[strings.ToLower(line)] = line
 		}
 	}
 	log.Printf("Loaded %d entries from gopass", len(entries))
@@ -114,7 +66,7 @@ func loadEntries() []entry {
 }
 
 func main() {
-	syslogWriter, err := syslog.New(syslog.LOG_INFO|syslog.LOG_USER, "gopass-plugin")
+	syslogWriter, err := syslog.New(syslog.LOG_DEBUG|syslog.LOG_USER, "gopass-plugin")
 	if err != nil {
 		log.SetOutput(os.Stderr)
 		log.SetPrefix("gopass-plugin: ")
@@ -127,134 +79,86 @@ func main() {
 		defer syslogWriter.Close()
 	}
 
+	if args := os.Args; len(args) > 1 && args[1] == "paste" {
+		secret, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			log.Printf("ERROR: reading secret from stdin: %v", err)
+			os.Exit(1)
+		}
+		if len(secret) == 0 {
+			log.Println("ERROR: stdin was empty, nothing to type")
+			os.Exit(1)
+		}
+
+		if err := autotype.PressPaste(); err != nil {
+			log.Printf("ERROR: typeString failed: %v", err)
+		}
+		os.Exit(0)
+	}
+
 	gopassPath = findGopass()
 	log.Printf("Gopass plugin started as user=%s HOME=%s gopass=%s", os.Getenv("USER"), os.Getenv("HOME"), gopassPath)
+	defer log.Println("Gopass plugin stopped")
 
 	allEntries := loadEntries()
 
-	var (
-		lastResults  []string
-		resultsMu    sync.Mutex
-		searchCancel context.CancelFunc
-		searchDone   chan struct{}
-	)
-
-	cancelSearch := func() {
-		if searchCancel != nil {
-			searchCancel()
-			<-searchDone // wait for goroutine to send Finished and exit
-			searchCancel = nil
-			searchDone = nil
-		}
-	}
-
-	requests := make(chan string, 64)
-
-	// Read from stdin and send to requests channel in a goroutine
-	go func() {
-		scanner := bufio.NewScanner(os.Stdin)
-		for scanner.Scan() {
-			requests <- scanner.Text()
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("ERROR: stdin read error: %v", err)
-		}
-		close(requests)
-	}()
-
-	// Process requests from the requests channel
-	for line := range requests {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == `"Exit"` {
-			log.Println("Exiting")
-			cancelSearch()
-			defer respondRaw(`"Finished"`)
-			return
-		}
-		if trimmed == `"Interrupt"` {
-			log.Println("Interrupted")
-			wasSearching := searchCancel != nil
-			cancelSearch()
-			if !wasSearching {
-				respondRaw(`"Finished"`)
+	launcher.Run(launcher.Config{
+		Logger: log.Default(),
+		OnSearch: func(ctx context.Context, query string, appendResult func(launcher.SearchResult)) error {
+			query = strings.TrimPrefix(query, "gp ")
+			lowerQuery := strings.ToLower(query)
+			count := 0
+			// we're using a map to avoid always displaying the same entries in the same order when refining the search
+			// and to display an exact match first when it exists
+			if exactMatch, ok := allEntries[lowerQuery]; ok {
+				appendResult(launcher.SearchResult{
+					Name:        exactMatch,
+					Description: "Copy password to clipboard",
+					IconName:    "dialog-password",
+				})
 			}
-			continue
-		}
-
-		var req Request
-		if err := json.Unmarshal([]byte(line), &req); err != nil {
-			log.Printf("ERROR: failed to parse request: %v", err)
-			continue
-		}
-
-		switch {
-		case req.Search != nil:
-			cancelSearch()
-
-			query := strings.TrimPrefix(*req.Search, "gp ")
-
-			ctx, cancel := context.WithCancel(context.Background())
-			searchCancel = cancel
-			done := make(chan struct{})
-			searchDone = done
-
-			go func(ctx context.Context, query string) {
-				defer close(done)
-				defer respondRaw(`"Finished"`)
-
-				respondRaw(`"Clear"`)
-
-				lowerQuery := strings.ToLower(query)
-				var matched []string
-
-				for _, e := range allEntries {
-					if ctx.Err() != nil {
-						resultsMu.Lock()
-						lastResults = matched
-						resultsMu.Unlock()
-						return
-					}
-					if lowerQuery == "" || strings.Contains(e.lower, lowerQuery) {
-						respond(AppendResponse{
-							Append: PluginSearchResult{
-								ID:          uint32(len(matched)),
-								Name:        e.original,
-								Description: "Copy password to clipboard",
-								Icon:        &IconSource{Name: &passwordIcon},
-							},
-						})
-						matched = append(matched, e.original)
-						if len(matched) >= maxResults {
-							break
-						}
+			for lower, original := range allEntries {
+				if lower == lowerQuery {
+					// done just above
+					continue
+				}
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if lowerQuery == "" || strings.Contains(lower, lowerQuery) {
+					appendResult(launcher.SearchResult{
+						Name:        original,
+						Description: "Copy password to clipboard",
+						IconName:    "dialog-password",
+					})
+					count++
+					if count >= maxResults {
+						break
 					}
 				}
-
-				resultsMu.Lock()
-				lastResults = matched
-				resultsMu.Unlock()
-			}(ctx, query)
-
-		case req.Activate != nil:
-			cancelSearch()
-
-			id := int(*req.Activate)
-			resultsMu.Lock()
-			if id < len(lastResults) {
-				entry := lastResults[id]
-				resultsMu.Unlock()
-				cmd := exec.Command(gopassPath, "show", "-C", entry)
-				if out, err := cmd.CombinedOutput(); err != nil {
-					log.Printf("ERROR: gopass show -C failed: %v, output: %s", err, string(out))
-				}
-			} else {
-				resultsMu.Unlock()
-				log.Printf("ERROR: Activate id=%d out of range (have %d results)", id, len(lastResults))
 			}
-			respondRaw(`"Close"`)
-
-		default:
-			log.Printf("Unhandled request: %s", line)
-		}
-	}
+			return nil
+		},
+		OnActivate: func(entry string) error {
+			cmd := exec.Command(gopassPath, "--nosync", "show", "-C=false", "-c=true", "-o", entry)
+			out, err := cmd.Output()
+			if err != nil {
+				return fmt.Errorf("gopass show -o failed: %w", err)
+			}
+			secret := strings.TrimSuffix(string(out), "\n")
+			log.Printf("Retrieved password for entry %s, spawning paste process", entry)
+			pasteCmd := exec.Command(os.Args[0], "paste")
+			pasteCmd.SysProcAttr = &syscall.SysProcAttr{
+				Setpgid: true,
+			}
+			pasteCmd.Stdin = strings.NewReader(secret)
+			pasteCmd.Stdout = nil
+			pasteCmd.Stderr = nil
+			if err := pasteCmd.Start(); err != nil {
+				return fmt.Errorf("'%s paste' start failed: %w", os.Args[0], err)
+			}
+			log.Printf("Started '%s paste' (pid %d) for entry %s", os.Args[0], pasteCmd.Process.Pid, entry)
+			return nil
+		},
+	})
 }

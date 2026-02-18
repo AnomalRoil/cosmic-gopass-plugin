@@ -15,4 +15,4 @@ And then just try typing `gp ` in cosmic-launcher to see your gopass entries.
 
 # Important dev details
 
-All the received queries on stdin need a `"Finished"` response, even when a new `Search` or a new `Interrupt` arrives to cancel the previous one. 
+This isn't very well documented in github.com/pop-os/launcher at the moment, but all the received `Search` queries on stdin need a `"Finished"` response, even when a new `Search` or a new `Interrupt` arrives to cancel the previous one. 

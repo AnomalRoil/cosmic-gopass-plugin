@@ -12,6 +12,8 @@ import (
 	"sync"
 )
 
+var DebugLogging = false
+
 // SearchResult is a single item returned by the OnSearch callback.
 type SearchResult struct {
 	Name        string
@@ -84,7 +86,9 @@ func Run(cfg Config) {
 			l.Printf("ERROR: failed to marshal response: %v", err)
 			return
 		}
-		l.Println(string(data))
+		if DebugLogging {
+			l.Println(string(data))
+		}
 		stdout.Write(data)
 		stdout.Write([]byte{'\n'})
 	}
@@ -92,16 +96,24 @@ func Run(cfg Config) {
 	respondRaw := func(s string) {
 		outputMu.Lock()
 		defer outputMu.Unlock()
+
 		l.Println(s)
+
 		fmt.Fprintln(stdout, s)
 	}
 
 	cancelSearch := func() {
+		if DebugLogging {
+			l.Println("Cancelling search")
+		}
 		if searchCancel != nil {
 			searchCancel()
 			<-searchDone
 			searchCancel = nil
 			searchDone = nil
+			if DebugLogging {
+				l.Println("Search cancelled")
+			}
 		}
 	}
 
@@ -110,6 +122,9 @@ func Run(cfg Config) {
 	go func() {
 		scanner := bufio.NewScanner(stdin)
 		for scanner.Scan() {
+			if DebugLogging {
+				l.Println("Received request: " + scanner.Text())
+			}
 			requests <- scanner.Text()
 		}
 		if err := scanner.Err(); err != nil {
@@ -119,21 +134,20 @@ func Run(cfg Config) {
 	}()
 
 	for line := range requests {
-		l.Println("Received request: " + line)
 		trimmed := strings.TrimSpace(line)
 		if trimmed == `"Exit"` {
-			l.Println("Exiting")
+			if DebugLogging {
+				l.Println("Exiting")
+			}
 			cancelSearch()
 			defer respondRaw(`"Finished"`)
 			return
 		}
 		if trimmed == `"Interrupt"` {
-			l.Println("Interrupted")
-			wasSearching := searchCancel != nil
-			cancelSearch()
-			if !wasSearching {
-				respondRaw(`"Finished"`)
+			if DebugLogging {
+				l.Println("Interrupted")
 			}
+			cancelSearch()
 			continue
 		}
 
@@ -163,6 +177,8 @@ func Run(cfg Config) {
 				var matched []string
 
 				appendResult := func(sr SearchResult) {
+					// BUG ?? If this is taking a long time, it seems our plugin isn't receiving all the requests from the launcher
+					// to reproduce, use for example here a little: <-time.After(500 * time.Millisecond)
 					var icon *iconSource
 					if sr.IconName != "" {
 						icon = &iconSource{Name: &sr.IconName}

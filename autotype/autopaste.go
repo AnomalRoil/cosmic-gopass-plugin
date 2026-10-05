@@ -1,6 +1,7 @@
 package autotype
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,12 +10,12 @@ import (
 
 // PressPaste simulates the paste key being pressed by using a fake /dev/uinput device.
 // Tested on Wayland and working, your mileage may vary on other systems.
-func PressPaste() error {
+func PressPaste() (err error) {
 	keyboard, err := uinput.CreateKeyboard("/dev/uinput", []byte("gopasspasteplugin"))
 	if err != nil {
 		return fmt.Errorf("create virtual keyboard: %w", err)
 	}
-	defer keyboard.Close()
+	defer func() { err = errors.Join(err, keyboard.Close()) }()
 
 	if err := keyboard.KeyPress(uinput.KeyPaste); err != nil {
 		return fmt.Errorf("key press for paste: %w", err)

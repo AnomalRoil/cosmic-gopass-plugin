@@ -19,6 +19,8 @@ type SearchResult struct {
 	Name        string
 	Description string
 	IconName    string // optional; if empty, no icon is sent
+	// Payload is handed back to OnActivate and never sent to the launcher.
+	Payload any
 }
 
 // Config configures a launcher plugin.
@@ -27,7 +29,7 @@ type Config struct {
 	Stdout     io.Writer   // if nil, defaults to os.Stdout
 	Logger     *log.Logger // if nil, logging is discarded
 	OnSearch   func(ctx context.Context, query string, appendResult func(SearchResult)) error
-	OnActivate func(entry string) error
+	OnActivate func(SearchResult) error
 }
 
 // LoadConfig validates required callbacks and prevents runtime panics and loads the config.
@@ -73,7 +75,7 @@ func Run(cfg Config) {
 	var (
 		outputMu     sync.Mutex
 		resultsMu    sync.Mutex
-		lastResults  []string
+		lastResults  []SearchResult
 		searchCancel context.CancelFunc
 		searchDone   chan struct{}
 	)
@@ -89,17 +91,20 @@ func Run(cfg Config) {
 		if DebugLogging {
 			l.Println(string(data))
 		}
-		stdout.Write(data)
-		stdout.Write([]byte{'\n'})
+		if _, err := stdout.Write(append(data, '\n')); err != nil {
+			l.Printf("ERROR: failed to write response: %v", err)
+		}
 	}
 
 	respondRaw := func(s string) {
 		outputMu.Lock()
 		defer outputMu.Unlock()
-
-		l.Println(s)
-
-		fmt.Fprintln(stdout, s)
+		if DebugLogging {
+			l.Println(s)
+		}
+		if _, err := fmt.Fprintln(stdout, s); err != nil {
+			l.Printf("ERROR: failed to write response: %v", err)
+		}
 	}
 
 	cancelSearch := func() {
@@ -140,7 +145,7 @@ func Run(cfg Config) {
 				l.Println("Exiting")
 			}
 			cancelSearch()
-			defer respondRaw(`"Finished"`)
+			respondRaw(`"Finished"`)
 			return
 		}
 		if trimmed == `"Interrupt"` {
@@ -174,7 +179,7 @@ func Run(cfg Config) {
 
 				respondRaw(`"Clear"`)
 
-				var matched []string
+				var matched []SearchResult
 
 				appendResult := func(sr SearchResult) {
 					// BUG ?? If this is taking a long time, it seems our plugin isn't receiving all the requests from the launcher
@@ -191,7 +196,7 @@ func Run(cfg Config) {
 							Icon:        icon,
 						},
 					})
-					matched = append(matched, sr.Name)
+					matched = append(matched, sr)
 				}
 
 				if err := cfg.OnSearch(ctx, query, appendResult); err != nil {
@@ -208,7 +213,7 @@ func Run(cfg Config) {
 
 			id := int(*req.Activate)
 			resultsMu.Lock()
-			var entry string
+			var entry SearchResult
 			if id < len(lastResults) {
 				entry = lastResults[id]
 				resultsMu.Unlock()

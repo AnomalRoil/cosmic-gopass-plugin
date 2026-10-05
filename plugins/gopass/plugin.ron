@@ -1,6 +1,6 @@
 (
     name: "Gopass",
-    description: "Syntax: gp <query>\nCopy password from gopass to clipboard",
+    description: "Syntax: gp [-o|-otp] [-n|-name] [:KEY] <words>\nCopy a password, key, OTP or entry name from gopass",
     query: (
         regex: "^gp ",
         help: "gp ",

@@ -85,8 +85,13 @@ func copyToClipboard(sel selection) error {
 	case modeOTP:
 		cmd = exec.Command(gopassPath, "--nosync", "otp", "--clip", sel.name)
 	case modeName:
+		// wl-copy forks a daemon that inherits stdout and stderr, so capturing them would block forever.
 		cmd = exec.Command("wl-copy")
 		cmd.Stdin = strings.NewReader(path.Base(sel.name))
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("wl-copy: %w", err)
+		}
+		return nil
 	default:
 		cmd = exec.Command(gopassPath, "--nosync", "show", "-C=false", "-c=true", "-o", sel.name)
 	}

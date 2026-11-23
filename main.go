@@ -1,16 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"log"
 	"log/syslog"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/AnomalRoil/cosmic-gopass-plugin/autotype"
 	"github.com/AnomalRoil/cosmic-gopass-plugin/launcher"
@@ -18,7 +20,10 @@ import (
 
 var gopassPath string
 
-const maxResults = 19
+const (
+	maxResults  = 20
+	reloadAfter = time.Minute
+)
 
 func findGopass() string {
 	if p, err := exec.LookPath("gopass"); err == nil {
@@ -45,24 +50,55 @@ func findGopass() string {
 	return "gopass"
 }
 
-func loadEntries() map[string]string {
-	log.Println("Loading gopass entries...")
-	cmd := exec.Command(gopassPath, "--nosync", "ls", "-flat")
-	out, err := cmd.Output()
+func loadEntries() ([]entry, error) {
+	out, err := exec.Command(gopassPath, "--nosync", "ls", "-flat").Output()
 	if err != nil {
-		log.Printf("ERROR: gopass ls failed: %v", err)
-		return nil
+		return nil, fmt.Errorf("gopass ls: %w", err)
 	}
-	allEntries := strings.Split(strings.TrimSpace(string(out)), "\n")
-	entries := make(map[string]string, len(allEntries))
-	for _, line := range allEntries {
-		if line != "" {
-			// we pre-compute the lower case version of the entry to avoid doing it in the loop
-			entries[strings.ToLower(line)] = line
+	return newEntries(strings.Split(string(out), "\n")), nil
+}
+
+func describe(q query, name string) string {
+	switch q.mode {
+	case modeKey:
+		return fmt.Sprintf("Copy %s to clipboard", q.key)
+	case modeOTP:
+		return "Copy OTP to clipboard"
+	case modeName:
+		return fmt.Sprintf("Copy name %q to clipboard", path.Base(name))
+	default:
+		return "Copy password to clipboard"
+	}
+}
+
+// selection is the launcher.SearchResult payload.
+type selection struct {
+	name  string
+	query query
+}
+
+func copyToClipboard(sel selection) error {
+	var cmd *exec.Cmd
+	switch sel.query.mode {
+	case modeKey:
+		cmd = exec.Command(gopassPath, "--nosync", "show", "-C=false", "-c=true", sel.name, sel.query.key)
+	case modeOTP:
+		cmd = exec.Command(gopassPath, "--nosync", "otp", "--clip", sel.name)
+	case modeName:
+		// wl-copy forks a daemon that inherits stdout and stderr, so capturing them would block forever.
+		cmd = exec.Command("wl-copy")
+		cmd.Stdin = strings.NewReader(path.Base(sel.name))
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("wl-copy: %w", err)
 		}
+		return nil
+	default:
+		cmd = exec.Command(gopassPath, "--nosync", "show", "-C=false", "-c=true", "-o", sel.name)
 	}
-	log.Printf("Loaded %d entries from gopass", len(entries))
-	return entries
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("%s: %w: %s", strings.Join(cmd.Args, " "), err, bytes.TrimSpace(out))
+	}
+	return nil
 }
 
 func main() {
@@ -76,88 +112,66 @@ func main() {
 		log.SetOutput(syslogWriter)
 		log.SetPrefix("")
 		log.SetFlags(0)
-		defer syslogWriter.Close()
+		defer syslogWriter.Close() //nolint:errcheck // nothing left to log to
 	}
 
-	if args := os.Args; len(args) > 1 && args[1] == "paste" {
-		secret, err := io.ReadAll(os.Stdin)
-		if err != nil {
-			log.Printf("ERROR: reading secret from stdin: %v", err)
-			os.Exit(1)
-		}
-		if len(secret) == 0 {
-			log.Println("ERROR: stdin was empty, nothing to type")
-			os.Exit(1)
-		}
-
+	if len(os.Args) > 1 && os.Args[1] == "paste" {
 		if err := autotype.PressPaste(); err != nil {
-			log.Printf("ERROR: typeString failed: %v", err)
+			log.Printf("ERROR: paste failed: %v", err)
+			os.Exit(1)
 		}
-		os.Exit(0)
+		return
 	}
 
 	gopassPath = findGopass()
 	log.Printf("Gopass plugin started as user=%s HOME=%s gopass=%s", os.Getenv("USER"), os.Getenv("HOME"), gopassPath)
 	defer log.Println("Gopass plugin stopped")
 
-	allEntries := loadEntries()
+	// Searches never run concurrently, so entries and loadedAt need no lock.
+	var (
+		entries  []entry
+		loadedAt time.Time
+	)
 
 	launcher.Run(launcher.Config{
 		Logger: log.Default(),
-		OnSearch: func(ctx context.Context, query string, appendResult func(launcher.SearchResult)) error {
-			query = strings.TrimPrefix(query, "gp ")
-			lowerQuery := strings.ToLower(query)
-			count := 0
-			// we're using a map to avoid always displaying the same entries in the same order when refining the search
-			// and to display an exact match first when it exists
-			if exactMatch, ok := allEntries[lowerQuery]; ok {
-				appendResult(launcher.SearchResult{
-					Name:        exactMatch,
-					Description: "Copy password to clipboard",
-					IconName:    "dialog-password",
-				})
+		OnSearch: func(ctx context.Context, raw string, appendResult func(launcher.SearchResult)) error {
+			if time.Since(loadedAt) > reloadAfter {
+				fresh, err := loadEntries()
+				if err != nil {
+					log.Printf("ERROR: keeping %d cached entries: %v", len(entries), err)
+				} else {
+					entries, loadedAt = fresh, time.Now()
+				}
 			}
-			for lower, original := range allEntries {
-				if lower == lowerQuery {
-					// done just above
-					continue
-				}
-				if ctx.Err() != nil {
-					return ctx.Err()
-				}
-				if lowerQuery == "" || strings.Contains(lower, lowerQuery) {
-					appendResult(launcher.SearchResult{
-						Name:        original,
-						Description: "Copy password to clipboard",
-						IconName:    "dialog-password",
-					})
-					count++
-					if count >= maxResults {
-						break
-					}
-				}
+			q := parseQuery(raw)
+			names, err := search(ctx, entries, q.terms, maxResults)
+			if err != nil {
+				return err
+			}
+			for _, name := range names {
+				appendResult(launcher.SearchResult{
+					Name:        name,
+					Description: describe(q, name),
+					IconName:    "dialog-password",
+					Payload:     selection{name: name, query: q},
+				})
 			}
 			return nil
 		},
-		OnActivate: func(entry string) error {
-			cmd := exec.Command(gopassPath, "--nosync", "show", "-C=false", "-c=true", "-o", entry)
-			out, err := cmd.Output()
-			if err != nil {
-				return fmt.Errorf("gopass show -o failed: %w", err)
+		OnActivate: func(r launcher.SearchResult) error {
+			sel := r.Payload.(selection)
+			if err := copyToClipboard(sel); err != nil {
+				return err
 			}
-			secret := strings.TrimSuffix(string(out), "\n")
-			log.Printf("Retrieved password for entry %s, spawning paste process", entry)
-			pasteCmd := exec.Command(os.Args[0], "paste")
-			pasteCmd.SysProcAttr = &syscall.SysProcAttr{
-				Setpgid: true,
+			// A separate process group lets the paste outlive the plugin once the launcher closes.
+			paste := exec.Command(os.Args[0], "paste")
+			paste.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+			if err := paste.Start(); err != nil {
+				return fmt.Errorf("start '%s paste': %w", os.Args[0], err)
 			}
-			pasteCmd.Stdin = strings.NewReader(secret)
-			pasteCmd.Stdout = nil
-			pasteCmd.Stderr = nil
-			if err := pasteCmd.Start(); err != nil {
-				return fmt.Errorf("'%s paste' start failed: %w", os.Args[0], err)
-			}
-			log.Printf("Started '%s paste' (pid %d) for entry %s", os.Args[0], pasteCmd.Process.Pid, entry)
+			go paste.Wait() //nolint:errcheck // the paste process logs its own failures
+			log.Printf("Activated %s: %s, pasting (pid %d)", sel.name, describe(sel.query, sel.name), paste.Process.Pid)
 			return nil
 		},
 	})

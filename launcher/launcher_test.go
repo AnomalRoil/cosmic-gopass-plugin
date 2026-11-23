@@ -40,7 +40,7 @@ func runTrace(
 	t *testing.T,
 	input []string,
 	onSearch func(context.Context, string, func(SearchResult)) error,
-	onActivate func(string) error,
+	onActivate func(SearchResult) error,
 ) (outputLines []string, logOutput string) {
 	t.Helper()
 
@@ -84,7 +84,7 @@ func TestLoadConfigNilReceiver(t *testing.T) {
 
 func TestLoadConfigMissingOnSearch(t *testing.T) {
 	c := &Config{
-		OnActivate: func(string) error { return nil },
+		OnActivate: func(SearchResult) error { return nil },
 	}
 	_, _, _, err := c.LoadConfig()
 	if err == nil || !strings.Contains(err.Error(), "OnSearch") {
@@ -105,7 +105,7 @@ func TestLoadConfigMissingOnActivate(t *testing.T) {
 func TestLoadConfigDefaults(t *testing.T) {
 	c := &Config{
 		OnSearch:   func(context.Context, string, func(SearchResult)) error { return nil },
-		OnActivate: func(string) error { return nil },
+		OnActivate: func(SearchResult) error { return nil },
 	}
 	l, stdin, stdout, err := c.LoadConfig()
 	if err != nil {
@@ -132,7 +132,7 @@ func TestLoadConfigCustomValues(t *testing.T) {
 		Stdout:     &customStdout,
 		Logger:     customLogger,
 		OnSearch:   func(context.Context, string, func(SearchResult)) error { return nil },
-		OnActivate: func(string) error { return nil },
+		OnActivate: func(SearchResult) error { return nil },
 	}
 	l, stdin, stdout, err := c.LoadConfig()
 	if err != nil {
@@ -170,7 +170,7 @@ func TestExitImmediately(t *testing.T) {
 			t.Error("OnSearch called unexpectedly")
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			t.Error("OnActivate called unexpectedly")
 			return nil
 		},
@@ -197,7 +197,7 @@ func TestSearchThenExit(t *testing.T) {
 			add(SearchResult{Name: "Email/work", Description: "Email/work", IconName: "dialog-password"})
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			t.Error("OnActivate called unexpectedly")
 			return nil
 		},
@@ -227,8 +227,8 @@ func TestSearchActivateExit(t *testing.T) {
 			add(SearchResult{Name: "Email/work", Description: "Email/work", IconName: "dialog-password"})
 			return nil
 		},
-		func(entry string) error {
-			activated = entry
+		func(r SearchResult) error {
+			activated = r.Name
 			return nil
 		},
 	)
@@ -249,7 +249,7 @@ func TestSearchActivateExit(t *testing.T) {
 }
 
 func TestActivateSecondResult(t *testing.T) {
-	var activated string
+	var activated SearchResult
 	got, _ := runTrace(t,
 		// Input trace:
 		[]string{
@@ -259,17 +259,17 @@ func TestActivateSecondResult(t *testing.T) {
 		},
 		func(ctx context.Context, q string, add func(SearchResult)) error {
 			add(SearchResult{Name: "Email/personal", Description: "personal email"})
-			add(SearchResult{Name: "Email/work", Description: "work email"})
+			add(SearchResult{Name: "Email/work", Description: "work email", Payload: 42})
 			return nil
 		},
-		func(entry string) error {
-			activated = entry
+		func(r SearchResult) error {
+			activated = r
 			return nil
 		},
 	)
 
-	if activated != "Email/work" {
-		t.Errorf("activated entry = %q, want %q", activated, "Email/work")
+	if activated.Name != "Email/work" || activated.Payload != 42 {
+		t.Errorf("activated = %+v, want Name %q and Payload 42", activated, "Email/work")
 	}
 
 	// Expected output trace:
@@ -294,7 +294,7 @@ func TestSearchNoIcon(t *testing.T) {
 			add(SearchResult{Name: "plain-entry", Description: "no icon here"})
 			return nil
 		},
-		func(entry string) error { return nil },
+		func(SearchResult) error { return nil },
 	)
 
 	// Expected output trace (no "icon" field):
@@ -316,7 +316,7 @@ func TestEmptySearchResults(t *testing.T) {
 		func(ctx context.Context, q string, add func(SearchResult)) error {
 			return nil
 		},
-		func(entry string) error { return nil },
+		func(SearchResult) error { return nil },
 	)
 
 	// Expected output trace:
@@ -339,7 +339,7 @@ func TestConsecutiveSearches(t *testing.T) {
 			add(SearchResult{Name: "result-" + q, Description: q})
 			return nil
 		},
-		func(entry string) error { return nil },
+		func(SearchResult) error { return nil },
 	)
 
 	// Expected output trace: both searches produce full output.
@@ -365,15 +365,14 @@ func TestInterruptWithoutActiveSearch(t *testing.T) {
 			t.Error("OnSearch called unexpectedly")
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			t.Error("OnActivate called unexpectedly")
 			return nil
 		},
 	)
 
-	// Expected output trace: Interrupt with no search sends its own Finished.
+	// Expected output trace: only Exit sends Finished.
 	assertLines(t, got, []string{
-		`"Finished"`,
 		`"Finished"`,
 	})
 }
@@ -390,7 +389,7 @@ func TestActivateOutOfRange(t *testing.T) {
 			add(SearchResult{Name: "only-one", Description: "single result", IconName: "dialog-password"})
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			t.Error("OnActivate should not be called for out-of-range ID")
 			return nil
 		},
@@ -422,7 +421,7 @@ func TestActivateCallbackError(t *testing.T) {
 			add(SearchResult{Name: "entry", Description: "desc"})
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			return fmt.Errorf("paste failed: device busy")
 		},
 	)
@@ -452,7 +451,7 @@ func TestUnhandledRequest(t *testing.T) {
 			t.Error("OnSearch called unexpectedly")
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			t.Error("OnActivate called unexpectedly")
 			return nil
 		},
@@ -478,7 +477,7 @@ func TestInvalidJSON(t *testing.T) {
 			t.Error("OnSearch called unexpectedly")
 			return nil
 		},
-		func(entry string) error {
+		func(SearchResult) error {
 			t.Error("OnActivate called unexpectedly")
 			return nil
 		},
@@ -511,7 +510,7 @@ func TestSearchInterruptCancelsContext(t *testing.T) {
 			<-ctx.Done()
 			return ctx.Err()
 		},
-		OnActivate: func(entry string) error {
+		OnActivate: func(SearchResult) error {
 			t.Error("OnActivate called unexpectedly")
 			return nil
 		},
@@ -531,17 +530,24 @@ func TestSearchInterruptCancelsContext(t *testing.T) {
 	go func() {
 		defer close(runDone)
 		Run(cfg)
-		stdoutW.Close()
+		stdoutW.Close() //nolint:errcheck // closing a PipeWriter never fails
 	}()
 
 	// Send a search that will block until its context is cancelled.
-	fmt.Fprintln(stdinW, `{"Search":"slow-query"}`)
+	send := func(line string) {
+		t.Helper()
+		if _, err := fmt.Fprintln(stdinW, line); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send(`{"Search":"slow-query"}`)
 	<-searchStarted
 
 	// Interrupt cancels the search context; then exit.
-	fmt.Fprintln(stdinW, `"Interrupt"`)
-	fmt.Fprintln(stdinW, `"Exit"`)
-	stdinW.Close()
+	send(`"Interrupt"`)
+	send(`"Exit"`)
+	stdinW.Close() //nolint:errcheck // closing a PipeWriter never fails
 
 	<-runDone
 	<-outputDone
